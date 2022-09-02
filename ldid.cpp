@@ -2,6 +2,7 @@
  * Copyright (C) 2007-2015  Jay Freeman (saurik)
 */
 
+/* SPDX-License-Identifier: AGPL-3.0-only */
 /* GNU Affero General Public License, Version 3 {{{ */
 /*
  * This program is free software: you can redistribute it and/or modify
@@ -19,6 +20,7 @@
 **/
 /* }}} */
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -42,7 +44,6 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
-#ifndef LDID_NOSMIME
 #include <openssl/opensslv.h>
 # if OPENSSL_VERSION_MAJOR >= 3
 #  include <openssl/provider.h>
@@ -52,47 +53,10 @@
 #include <openssl/pkcs7.h>
 #include <openssl/pkcs12.h>
 #include <openssl/ui.h>
-#endif
 
-#ifdef __APPLE__
-#include <CommonCrypto/CommonDigest.h>
+#include <openssl/evp.h>
 
-#define LDID_SHA1_DIGEST_LENGTH CC_SHA1_DIGEST_LENGTH
-#define LDID_SHA1 CC_SHA1
-#define LDID_SHA1_CTX CC_SHA1_CTX
-#define LDID_SHA1_Init CC_SHA1_Init
-#define LDID_SHA1_Update CC_SHA1_Update
-#define LDID_SHA1_Final CC_SHA1_Final
-
-#define LDID_SHA256_DIGEST_LENGTH CC_SHA256_DIGEST_LENGTH
-#define LDID_SHA256 CC_SHA256
-#define LDID_SHA256_CTX CC_SHA256_CTX
-#define LDID_SHA256_Init CC_SHA256_Init
-#define LDID_SHA256_Update CC_SHA256_Update
-#define LDID_SHA256_Final CC_SHA256_Final
-#else
-#include <openssl/sha.h>
-
-#define LDID_SHA1_DIGEST_LENGTH SHA_DIGEST_LENGTH
-#define LDID_SHA1 SHA1
-#define LDID_SHA1_CTX SHA_CTX
-#define LDID_SHA1_Init SHA1_Init
-#define LDID_SHA1_Update SHA1_Update
-#define LDID_SHA1_Final SHA1_Final
-
-#define LDID_SHA256_DIGEST_LENGTH SHA256_DIGEST_LENGTH
-#define LDID_SHA256 SHA256
-#define LDID_SHA256_CTX SHA256_CTX
-#define LDID_SHA256_Init SHA256_Init
-#define LDID_SHA256_Update SHA256_Update
-#define LDID_SHA256_Final SHA256_Final
-#endif
-
-#ifndef LDID_NOPLIST
 #include <plist/plist.h>
-#elif __APPLE__
-#include <CoreFoundation/CoreFoundation.h>
-#endif
 
 #include "ldid.hpp"
 
@@ -136,7 +100,8 @@
     for (auto success : (long[]) {EINTR, __VA_ARGS__}) \
         if (error == success) \
             return (decltype(expr)) -success; \
-    _assert_(false, "errno=%u", error); \
+    fprintf(stderr, "ldid: %s: %s\n", __func__, strerror(error)); \
+    exit(1); \
 } }()
 
 #define _trace() \
@@ -148,9 +113,8 @@
 #define _packed \
     __attribute__((packed))
 
-#ifndef LDID_NOSMIME
 std::string password;
-#endif
+std::vector<std::string> cleanup;
 
 template <typename Type_>
 struct Iterator_ {
@@ -624,7 +588,6 @@ static std::string der(const std::pair<std::string, std::string> &value) {
     return data.str();
 }
 
-#ifndef LDID_NOPLIST
 static std::string der(plist_t data) {
     switch (const auto type = plist_get_node_type(data)) {
         case PLIST_BOOLEAN: {
@@ -651,11 +614,13 @@ static std::string der(plist_t data) {
         } break;
 
         case PLIST_REAL: {
-            _assert(false);
+            fprintf(stderr, "ldid: Invalid plist entry type\n");
+            exit(1);
         } break;
 
         case PLIST_DATE: {
-            _assert(false);
+            fprintf(stderr, "ldid: Invalid plist entry type\n");
+            exit(1);
         } break;
 
         case PLIST_DATA: {
@@ -701,11 +666,11 @@ static std::string der(plist_t data) {
         } break;
 
         default: {
-            _assert_(false, "unsupported plist type %d", type);
+            fprintf(stderr, "ldid: Unsupported plist type %d", type);
+            exit(1);
         } break;
     }
 }
-#endif
 
 static inline uint16_t Swap_(uint16_t value) {
     return
@@ -839,7 +804,8 @@ class MachHeader :
             break;
 
             default:
-                _assert(false);
+                fprintf(stderr, "ldid: Unknown header magic\nAre you sure that is a Mach-O?\n");
+                exit(1);
         }
 
         void *post = mach_header_ + 1;
@@ -847,12 +813,13 @@ class MachHeader :
             post = (uint32_t *) post + 1;
         load_command_ = (struct load_command *) post;
 
-        _assert(
-            Swap(mach_header_->filetype) == MH_EXECUTE ||
-            Swap(mach_header_->filetype) == MH_DYLIB ||
-            Swap(mach_header_->filetype) == MH_DYLINKER ||
-            Swap(mach_header_->filetype) == MH_BUNDLE
-        );
+        if (Swap(mach_header_->filetype) != MH_EXECUTE &&
+            Swap(mach_header_->filetype) != MH_DYLIB &&
+            Swap(mach_header_->filetype) != MH_DYLINKER &&
+            Swap(mach_header_->filetype) != MH_BUNDLE) {
+            fprintf(stderr, "ldid: Unsupported Mach-O type\n");
+            exit(1);
+        }
     }
 
     bool Bits64() const {
@@ -1140,9 +1107,6 @@ enum MatchOperation {
 #define APPLE_ADS_OID APPLE_OID, 0x64
 #define APPLE_EXTENSION_OID APPLE_ADS_OID, 6
 
-#ifndef LDID_NOFLAGT
-extern "C" uint32_t hash(uint8_t *k, uint32_t length, uint32_t initval);
-#endif
 
 struct Algorithm {
     size_t size_;
@@ -1167,7 +1131,7 @@ struct AlgorithmSHA1 :
     Algorithm
 {
     AlgorithmSHA1() :
-        Algorithm(LDID_SHA1_DIGEST_LENGTH, CS_HASHTYPE_SHA160_160)
+        Algorithm(SHA_DIGEST_LENGTH, CS_HASHTYPE_SHA160_160)
     {
     }
 
@@ -1176,7 +1140,7 @@ struct AlgorithmSHA1 :
     }
 
     void operator ()(uint8_t *hash, const void *data, size_t size) const {
-        LDID_SHA1(static_cast<const uint8_t *>(data), size, hash);
+        SHA1(static_cast<const uint8_t *>(data), size, hash);
     }
 
     void operator ()(ldid::Hash &hash, const void *data, size_t size) const {
@@ -1184,7 +1148,7 @@ struct AlgorithmSHA1 :
     }
 
     void operator ()(std::vector<char> &hash, const void *data, size_t size) const {
-        hash.resize(LDID_SHA1_DIGEST_LENGTH);
+        hash.resize(SHA_DIGEST_LENGTH);
         return operator ()(reinterpret_cast<uint8_t *>(hash.data()), data, size);
     }
 
@@ -1197,7 +1161,7 @@ struct AlgorithmSHA256 :
     Algorithm
 {
     AlgorithmSHA256() :
-        Algorithm(LDID_SHA256_DIGEST_LENGTH, CS_HASHTYPE_SHA256_256)
+        Algorithm(SHA256_DIGEST_LENGTH, CS_HASHTYPE_SHA256_256)
     {
     }
 
@@ -1206,7 +1170,7 @@ struct AlgorithmSHA256 :
     }
 
     void operator ()(uint8_t *hash, const void *data, size_t size) const {
-        LDID_SHA256(static_cast<const uint8_t *>(data), size, hash);
+        SHA256(static_cast<const uint8_t *>(data), size, hash);
     }
 
     void operator ()(ldid::Hash &hash, const void *data, size_t size) const {
@@ -1214,7 +1178,7 @@ struct AlgorithmSHA256 :
     }
 
     void operator ()(std::vector<char> &hash, const void *data, size_t size) const {
-        hash.resize(LDID_SHA256_DIGEST_LENGTH);
+        hash.resize(SHA256_DIGEST_LENGTH);
         return operator ()(reinterpret_cast<uint8_t *>(hash.data()), data, size);
     }
 
@@ -1281,13 +1245,21 @@ class File {
     }
 
     ~File() {
+        close();
+    }
+
+    void close() {
         if (file_ != -1)
-            _syscall(close(file_));
+            _syscall(::close(file_));
+        file_ = -1;
     }
 
     void open(const char *path, int flags) {
-        _assert(file_ == -1);
-        file_ = _syscall(::open(path, flags));
+        file_ = ::open(path, flags);
+        if (file_ == -1) {
+            fprintf(stderr, "ldid: %s: %s\n", path, strerror(errno));
+            exit(1);
+        }
     }
 
     int file() const {
@@ -1300,14 +1272,6 @@ class Map {
     File file_;
     void *data_;
     size_t size_;
-
-    void clear() {
-        if (data_ == NULL)
-            return;
-        _syscall(munmap(data_, size_));
-        data_ = NULL;
-        size_ = 0;
-    }
 
   public:
     Map() :
@@ -1346,7 +1310,11 @@ class Map {
         _syscall(fstat(file, &stat));
         size_ = stat.st_size;
 
-        data_ = _syscall(mmap(NULL, size_, pflag, mflag, file, 0));
+        data_ = mmap(NULL, size_, pflag, mflag, file, 0);
+        if (data_ == MAP_FAILED) {
+            fprintf(stderr, "ldid: mmap: %s\n", strerror(errno));
+            exit(1);
+        }
     }
 
     void open(const std::string &path, bool edit) {
@@ -1354,6 +1322,15 @@ class Map {
             open(path, O_RDWR, PROT_READ | PROT_WRITE, MAP_SHARED);
         else
             open(path, O_RDONLY, PROT_READ, MAP_PRIVATE);
+    }
+
+    void clear() {
+        if (data_ == NULL)
+            return;
+        _syscall(munmap(data_, size_));
+        data_ = NULL;
+        size_ = 0;
+        file_.close();
     }
 
     void *data() const {
@@ -1368,13 +1345,11 @@ class Map {
         return std::string(static_cast<char *>(data_), size_);
     }
 };
-#endif
+#endif // LDID_NOTOOLS
 
 namespace ldid {
 
-#ifndef LDID_NOPLIST
 static plist_t plist(const std::string &data);
-#endif
 
 void Analyze(const MachHeader &mach_header, const Functor<void (const char *data, size_t size)> &entitle) {
     _foreach (load_command, mach_header.GetLoadCommands())
@@ -1403,7 +1378,10 @@ std::string Analyze(const void *data, size_t size) {
             if (entitlements.empty())
                 entitlements.assign(data, size);
             else
-                _assert(entitlements.compare(0, entitlements.size(), data, size) == 0);
+               if (entitlements.compare(0, entitlements.size(), data, size) != 0) {
+                   fprintf(stderr, "ldid: Entitlements do not match\n");
+                   exit(1);
+               }
         }));
 
     return entitlements;
@@ -1423,8 +1401,7 @@ static void Allocate(const void *idata, size_t isize, std::streambuf &output, co
 
         _foreach (load_command, mach_header.GetLoadCommands()) {
             uint32_t cmd(mach_header.Swap(load_command->cmd));
-            if (false);
-            else if (cmd == LC_CODE_SIGNATURE)
+            if (cmd == LC_CODE_SIGNATURE)
                 signature = reinterpret_cast<struct linkedit_data_command *>(load_command);
             else if (cmd == LC_SYMTAB)
                 symtab = reinterpret_cast<struct symtab_command *>(load_command);
@@ -1719,7 +1696,6 @@ static size_t put(std::streambuf &output, uint32_t magic, const Blobs &blobs) {
     return offset;
 }
 
-#ifndef LDID_NOSMIME
 class Buffer {
   private:
     BIO *bio_;
@@ -1749,7 +1725,10 @@ class Buffer {
     Buffer(PKCS7 *pkcs) :
         Buffer()
     {
-        _assert(i2d_PKCS7_bio(bio_, pkcs) != 0);
+        if (i2d_PKCS7_bio(bio_, pkcs) == 0){
+            fprintf(stderr, "ldid: An error occured while getting the PKCS7 file: %s\n", ERR_error_string(ERR_get_error(), NULL));
+            exit(1);
+        }
     }
 
     ~Buffer() {
@@ -1779,7 +1758,10 @@ class Stuff {
         value_(d2i_PKCS12_bio(bio, NULL)),
         ca_(NULL)
     {
-        _assert(value_ != NULL);
+        if (value_ == NULL){
+            fprintf(stderr, "ldid: An error occured while getting the PKCS12 file: %s\n", ERR_error_string(ERR_get_error(), NULL));
+            exit(1);
+        }
 
         if (!PKCS12_verify_mac(value_, "", 0) && password.empty()) {
             char passbuf[2048];
@@ -1787,13 +1769,21 @@ class Stuff {
             password = passbuf;
         }
 
-        _assert(PKCS12_parse(value_, password.c_str(), &key_, &cert_, &ca_) != 0);
-        _assert(key_ != NULL);
-        _assert(cert_ != NULL);
+        if (PKCS12_parse(value_, password.c_str(), &key_, &cert_, &ca_) <= 0){
+            fprintf(stderr, "ldid: An error occured while parsing: %s\n", ERR_error_string(ERR_get_error(), NULL));
+            exit(1);
+        }
+        if (key_ == NULL || cert_ == NULL){
+            fprintf(stderr, "ldid: An error occured while parsing: %s\nYour p12 cert might not be valid\n", ERR_error_string(ERR_get_error(), NULL));
+            exit(1);
+        }
 
         if (ca_ == NULL)
             ca_ = sk_X509_new_null();
-        _assert(ca_ != NULL);
+        if (ca_ == NULL){
+            fprintf(stderr, "ldid: An error occured while parsing: %s\n", ERR_error_string(ERR_get_error(), NULL));
+            exit(1);
+        }
     }
 
     Stuff(const std::string &data) :
@@ -1826,19 +1816,54 @@ class Stuff {
 };
 
 
-// xina fix;
-struct SEQUENCE_hash_sha1 {
-    uint8_t SEQUENCE[2] = {0x30, 0x1d};//size
-    uint8_t OBJECT_IDENTIFIER[7] = {0x06, 0x05, 0x2B, 0x0E, 0x03, 0x02,0x1A};//OBJECT IDENTIFIER 1.3.14.3.2.26 sha1 (OIW)
-    uint8_t hash_size[2] = {0x04, 0x14};
-    char hash[20];
-};
-struct SEQUENCE_hash_sha256 {
-    uint8_t SEQUENCE[2] = {0x30, 0x2d};//size
-    uint8_t OBJECT_IDENTIFIER[11] = {0x06 ,0x09 ,0x60, 0x86, 0x48, 0x01 ,0x65, 0x03, 0x04, 0x02, 0x01};//2.16.840.1.101.3.4.2.1 sha-256 (NIST Algorithm)
-    uint8_t hash_size[2] = {0x04, 0x20};//hash size
-    char hash[32];
-};
+
+int  get_signed_SEQUENCE_Hash(void ** data, const char * obj,void *hash, int hash_size)
+{
+    ASN1_OCTET_STRING *os;
+    void *p;
+    int i,total;
+    total=0;
+    ASN1_OBJECT *HASH256_OBJ = OBJ_txt2obj(obj, 1);
+    os=ASN1_OCTET_STRING_new();
+    ASN1_OCTET_STRING_set(os,(const unsigned char *)hash,hash_size);
+    i =i2d_ASN1_OBJECT(HASH256_OBJ,NULL);
+    i+=i2d_ASN1_OCTET_STRING(os,NULL);
+    total=ASN1_object_size(1,i,V_ASN1_SEQUENCE);
+    *data=malloc(total);
+    p=*data;
+    ASN1_put_object((unsigned char **)&p,1,i,V_ASN1_SEQUENCE,V_ASN1_UNIVERSAL);
+    i2d_ASN1_OBJECT(HASH256_OBJ,(unsigned char **)&p);
+    i2d_ASN1_OCTET_STRING(os, (unsigned char **)&p);
+    ASN1_OCTET_STRING_free(os);
+    ASN1_OBJECT_free(HASH256_OBJ);
+    return total;
+}
+
+bool add_signed_seq2hash(PKCS7_SIGNER_INFO *info,const std::vector<char>& alternateCDSHA1, const std::vector<char>& alternateCDSHA256,const std::string &xml)
+{
+    int total=0;
+    ASN1_OBJECT * SEC_OID_APPLE_HASH_AGILITY_OBJ  = OBJ_txt2obj("1.2.840.113635.100.9.1", 1);
+    ASN1_OBJECT * SEC_OID_APPLE_HASH_AGILITY_V2_OBJ = OBJ_txt2obj("1.2.840.113635.100.9.2", 1);
+    X509_ATTRIBUTE *attribute = X509_ATTRIBUTE_new();
+    X509_ATTRIBUTE_set1_object(attribute, SEC_OID_APPLE_HASH_AGILITY_V2_OBJ);
+    void *data=NULL;
+    total=get_signed_SEQUENCE_Hash(&data,"1.3.14.3.2.26",(void *)alternateCDSHA1.data(),alternateCDSHA1.size());
+    X509_ATTRIBUTE_set1_data(attribute, V_ASN1_SEQUENCE,data, total);
+    if (total!=0) free(data);
+    data=NULL;
+    total=get_signed_SEQUENCE_Hash(&data,"2.16.840.1.101.3.4.2.1",(void *)alternateCDSHA256.data(),alternateCDSHA256.size());
+    X509_ATTRIBUTE_set1_data(attribute, V_ASN1_SEQUENCE,data, total);
+    if (total!=0) free(data);
+    STACK_OF(X509_ATTRIBUTE) * sk= PKCS7_get_signed_attributes(info);
+    X509at_add1_attr_by_OBJ(&sk, SEC_OID_APPLE_HASH_AGILITY_OBJ, V_ASN1_OCTET_STRING, (const unsigned char *)xml.data(), xml.size());
+    X509at_add1_attr(&sk, attribute);
+    
+    ASN1_OBJECT_free(SEC_OID_APPLE_HASH_AGILITY_OBJ);
+    ASN1_OBJECT_free(SEC_OID_APPLE_HASH_AGILITY_V2_OBJ);
+    X509_ATTRIBUTE_free(attribute);
+    
+    return true;
+}
 
 
 class Signature {
@@ -1846,72 +1871,51 @@ class Signature {
     PKCS7 *value_;
 
   public:
-    Signature(const Stuff &stuff, const Buffer &data, const std::string &xml, const std::vector<char>& alternateCDSHA1,const std::vector<char>& alternateCDSHA256)
-    {
+    Signature(const Stuff &stuff, const Buffer &data, const std::string &xml, const std::vector<char>& alternateCDSHA1, const std::vector<char>& alternateCDSHA256) {
         value_ = PKCS7_new();
-        _assert(value_ != NULL);
-        
-        _assert(PKCS7_set_type(value_, NID_pkcs7_signed));
-        _assert(PKCS7_content_new(value_, NID_pkcs7_data));
-        
-        STACK_OF(X509) *certs(stuff);
-        for (unsigned i(0), e(sk_X509_num(certs)); i != e; i++)
-            _assert(PKCS7_add_certificate(value_, sk_X509_value(certs, e - i - 1)));
-        
-        auto info(PKCS7_sign_add_signer(value_, stuff, stuff, NULL, PKCS7_NOSMIMECAP));
-        _assert(info != NULL);
-        
-        X509_ATTRIBUTE *attribute = X509_ATTRIBUTE_new();
-        ASN1_OBJECT *obj2 = OBJ_txt2obj("1.2.840.113635.100.9.2", 1);
-        X509_ATTRIBUTE_set1_object(attribute, obj2);
-        // xina fix;
-        SEQUENCE_hash_sha1 seq1;
-        printf("alternateCDSHA1.size %d \n",alternateCDSHA1.size());
-        memcpy((void *)seq1.hash,(void *)alternateCDSHA1.data() ,alternateCDSHA1.size());
-        X509_ATTRIBUTE_set1_data(attribute, V_ASN1_SEQUENCE,&seq1, sizeof(seq1));
-        //PrintBuffer1(&seq1, sizeof(seq1));
-        printf("seq1 %d \n", sizeof(seq1));
-        // xina fix;
-        SEQUENCE_hash_sha256 seq256;
-        printf("alternateCDSHA256.size %d \n",alternateCDSHA256.size());
-        memcpy((void *)seq256.hash,(void *)alternateCDSHA256.data() ,alternateCDSHA256.size());
-        X509_ATTRIBUTE_set1_data(attribute, V_ASN1_SEQUENCE,&seq256, sizeof(seq256));
-        //  PrintBuffer1(&seq256, sizeof(seq256));
-        printf("seq256 %d \n", sizeof(seq256));
-
-            
-        STACK_OF(X509_ATTRIBUTE)    * sk= PKCS7_get_signed_attributes(info);
-        if (!sk_X509_ATTRIBUTE_push(sk, attribute)) {
-            printf("sk_X509_ATTRIBUTE_push error");
-            
+        if (value_ == NULL){
+            fprintf(stderr, "ldid: An error occured while getting creating PKCS7 file: %s\n", ERR_error_string(ERR_get_error(), NULL));
+            exit(1);
         }
+
+        if (PKCS7_set_type(value_, NID_pkcs7_signed) == 0 ||
+           PKCS7_content_new(value_, NID_pkcs7_data) == 0) {
+            fprintf(stderr, "ldid: An error occured while getting creating PKCS7 file: %s\n", ERR_error_string(ERR_get_error(), NULL));
+            exit(1);
+        }
+
+        STACK_OF(X509) *certs(stuff);
+        for (unsigned i(0), e(sk_X509_num(certs)); i != e; i++) {
+            if (PKCS7_add_certificate(value_, sk_X509_value(certs, e - i - 1)) == 0) {
+                fprintf(stderr, "ldid: An error occured while signing: %s\n", ERR_error_string(ERR_get_error(), NULL));
+                exit(1);
+            }
+        }
+
+        auto info(PKCS7_sign_add_signer(value_, stuff, stuff, NULL, PKCS7_NOSMIMECAP));
+        if (info == NULL){
+            fprintf(stderr, "ldid: An error occured while signing: %s\n", ERR_error_string(ERR_get_error(), NULL));
+            exit(1);
+        }
+
+        add_signed_seq2hash(info,alternateCDSHA1,alternateCDSHA256,xml);
         
         PKCS7_set_detached(value_, 1);
-        
-        ASN1_OCTET_STRING *string(ASN1_OCTET_STRING_new());
-        _assert(string != NULL);
-        try {
-            _assert(ASN1_STRING_set(string, xml.data(), xml.size()));
-            
-            static auto nid(OBJ_create("1.2.840.113635.100.9.1", "", ""));
-            _assert(PKCS7_add_signed_attribute(info, nid, V_ASN1_OCTET_STRING, string));
-        } catch (...) {
-            ASN1_OCTET_STRING_free(string);
-            throw;
+
+        if (PKCS7_final(value_, data, PKCS7_BINARY) == 0) {
+            fprintf(stderr, "ldid: Failed to sign: %s\n", ERR_error_string(ERR_get_error(), NULL));
+            exit(1);
         }
-        
-        _assert(PKCS7_final(value_, data, PKCS7_BINARY));
     }
-    
+
     ~Signature() {
         PKCS7_free(value_);
     }
-    
+
     operator PKCS7 *() const {
         return value_;
     }
 };
-#endif
 
 class NullBuffer :
     public std::streambuf
@@ -1932,25 +1936,31 @@ class HashBuffer :
   private:
     ldid::Hash &hash_;
 
-    LDID_SHA1_CTX sha1_;
-    LDID_SHA256_CTX sha256_;
+    EVP_MD_CTX *sha1_;
+    EVP_MD_CTX *sha256_;
 
   public:
     HashBuffer(ldid::Hash &hash) :
         hash_(hash)
     {
-        LDID_SHA1_Init(&sha1_);
-        LDID_SHA256_Init(&sha256_);
+        sha1_ = EVP_MD_CTX_new();
+        sha256_ = EVP_MD_CTX_new();
+        
+        EVP_DigestInit_ex(sha1_, EVP_get_digestbyname("sha1"), nullptr);
+        EVP_DigestInit_ex(sha256_, EVP_get_digestbyname("sha256"), nullptr);
     }
 
     ~HashBuffer() {
-        LDID_SHA1_Final(reinterpret_cast<uint8_t *>(hash_.sha1_), &sha1_);
-        LDID_SHA256_Final(reinterpret_cast<uint8_t *>(hash_.sha256_), &sha256_);
+        EVP_DigestFinal_ex(sha1_, reinterpret_cast<uint8_t *>(hash_.sha1_), nullptr);
+        EVP_DigestFinal_ex(sha256_, reinterpret_cast<uint8_t *>(hash_.sha256_), nullptr);
+        
+        EVP_MD_CTX_free(sha1_);
+        EVP_MD_CTX_free(sha256_);
     }
 
     virtual std::streamsize xsputn(const char_type *data, std::streamsize size) {
-        LDID_SHA1_Update(&sha1_, data, size);
-        LDID_SHA256_Update(&sha256_, data, size);
+        EVP_DigestUpdate(sha1_, data, size);
+        EVP_DigestUpdate(sha256_, data, size);
         return size;
     }
 
@@ -1993,7 +2003,11 @@ class Split {
     std::string base;
 
     Split(const std::string &path) {
+#if defined (__WIN32__) || defined (_MSC_VER) || defined (__MINGW32__)
+        size_t slash(path.rfind('\\'));
+#else
         size_t slash(path.rfind('/'));
+#endif
         if (slash == std::string::npos)
             base = path;
         else {
@@ -2006,14 +2020,18 @@ class Split {
 static void mkdir_p(const std::string &path) {
     if (path.empty())
         return;
-#ifdef __WIN32__
+#if defined (__WIN32__) || defined (_MSC_VER) || defined (__MINGW32__)
     if (_syscall(mkdir(path.c_str()), EEXIST) == -EEXIST)
         return;
 #else
     if (_syscall(mkdir(path.c_str(), 0755), EEXIST) == -EEXIST)
         return;
 #endif
+#if defined (__WIN32__) || defined (_MSC_VER) || defined (__MINGW32__)
+    auto slash(path.rfind('\\', path.size() - 1));
+#else
     auto slash(path.rfind('/', path.size() - 1));
+#endif
     if (slash == std::string::npos)
         return;
     mkdir_p(path.substr(0, slash));
@@ -2023,37 +2041,53 @@ static std::string Temporary(std::filebuf &file, const Split &split) {
     std::string temp(split.dir + ".ldid." + split.base);
     mkdir_p(split.dir);
     _assert_(file.open(temp.c_str(), std::ios::out | std::ios::trunc | std::ios::binary) == &file, "open(): %s", temp.c_str());
+    cleanup.push_back(temp);
     return temp;
 }
 
 static void Commit(const std::string &path, const std::string &temp) {
     struct stat info;
     if (_syscall(stat(path.c_str(), &info), ENOENT) == 0) {
-#ifndef __WIN32__
+#if !defined (__WIN32__) && !defined (_MSC_VER) && !defined (__MINGW32__)
         _syscall(chown(temp.c_str(), info.st_uid, info.st_gid));
 #endif
         _syscall(chmod(temp.c_str(), info.st_mode));
+
+#if defined (__WIN32__) || defined (_MSC_VER) || defined (__MINGW32__)
+        _syscall(remove(path.c_str()));
+#endif
     }
 
     _syscall(rename(temp.c_str(), path.c_str()));
+    cleanup.erase(std::remove(cleanup.begin(), cleanup.end(), temp), cleanup.end());
 }
-#endif
+#endif // LDID_NOTOOLS
 
 namespace ldid {
 
-#ifndef LDID_NOSMIME
 static void get(std::string &value, X509_NAME *name, int nid) {
     auto index(X509_NAME_get_index_by_NID(name, nid, -1));
-    _assert(index >= 0);
+    if (index < 0) {
+        fprintf(stderr, "ldid: An error occursed while parsing the certificate: %s\n", ERR_error_string(ERR_get_error(), NULL));
+        exit(1);
+    }
     auto next(X509_NAME_get_index_by_NID(name, nid, index));
-    _assert(next == -1);
+    if (next != -1) {
+        fprintf(stderr, "ldid: An error occursed while parsing the certificate: %s\n", ERR_error_string(ERR_get_error(), NULL));
+        exit(1);
+    }
     auto entry(X509_NAME_get_entry(name, index));
-    _assert(entry != NULL);
+    if (entry == NULL) {
+        fprintf(stderr, "ldid: An error occursed while parsing the certificate: %s\n", ERR_error_string(ERR_get_error(), NULL));
+        exit(1);
+    }
     auto asn(X509_NAME_ENTRY_get_data(entry));
-    _assert(asn != NULL);
+    if (asn == NULL) {
+        fprintf(stderr, "ldid: An error occursed while parsing the certificate: %s\n", ERR_error_string(ERR_get_error(), NULL));
+        exit(1);
+    }
     value.assign(reinterpret_cast<const char *>(ASN1_STRING_get0_data(asn)), ASN1_STRING_length(asn));
 }
-#endif
 
 static void req(std::streambuf &buffer, uint32_t value) {
     value = Swap(value);
@@ -2075,22 +2109,23 @@ static void req(std::streambuf &buffer, uint8_t (&&data)[Size_]) {
     put(buffer, zeros, 3 - (Size_ + 3) % 4);
 }
 
-Hash Sign(const void *idata, size_t isize, std::streambuf &output, const std::string &identifier, const std::string &entitlements, bool merge, const std::string &requirements, const std::string &key, const Slots &slots, uint32_t flags, bool platform, const Progress &progress) {
+Hash Sign(const void *idata, size_t isize, std::streambuf &output, const std::string &identifier, const std::string &entitlements, bool merge, const std::string &requirements, const std::string &key, const Slots &slots, uint32_t flags, uint8_t platform, const Progress &progress) {
     Hash hash;
 
 
     std::string team;
     std::string common;
 
-#ifndef LDID_NOSMIME
     if (!key.empty()) {
         Stuff stuff(key);
         auto name(X509_get_subject_name(stuff));
-        _assert(name != NULL);
+        if (name == NULL){
+            fprintf(stderr, "ldid: Your certificate might not be valid: %s\n", ERR_error_string(ERR_get_error(), NULL));
+            exit(1);
+        }
         get(team, name, NID_organizationalUnitName);
         get(common, name, NID_commonName);
     }
-#endif
 
 
     std::stringbuf backing;
@@ -2145,9 +2180,6 @@ Hash Sign(const void *idata, size_t isize, std::streambuf &output, const std::st
         alloc += sizeof(struct BlobIndex);
         alloc += backing.str().size();
 
-#ifdef LDID_NOPLIST
-        baton.entitlements_ = entitlements;
-#else
         if (merge)
             Analyze(mach_header, fun([&](const char *data, size_t size) {
                 baton.entitlements_.assign(data, size);
@@ -2156,11 +2188,17 @@ Hash Sign(const void *idata, size_t isize, std::streambuf &output, const std::st
         if (!baton.entitlements_.empty() || !entitlements.empty()) {
             auto combined(plist(baton.entitlements_));
             _scope({ plist_free(combined); });
-            _assert(plist_get_node_type(combined) == PLIST_DICT);
+            if (plist_get_node_type(combined) != PLIST_DICT) {
+                fprintf(stderr, "ldid: Existing entitlements are in wrong format\n");
+                exit(1);
+            };
 
             auto merging(plist(entitlements));
             _scope({ plist_free(merging); });
-            _assert(plist_get_node_type(merging) == PLIST_DICT);
+            if (plist_get_node_type(merging) != PLIST_DICT) {
+                fprintf(stderr, "ldid: Entitlements need a root key of dict\n");
+                exit(1);
+            };
 
             plist_dict_iter iterator(NULL);
             plist_dict_new_iter(merging, &iterator);
@@ -2185,7 +2223,6 @@ Hash Sign(const void *idata, size_t isize, std::streambuf &output, const std::st
 
             baton.entitlements_.assign(xml, size);
         }
-#endif
 
         if (!baton.entitlements_.empty()) {
             special = std::max(special, CSSLOT_ENTITLEMENTS);
@@ -2214,13 +2251,11 @@ Hash Sign(const void *idata, size_t isize, std::streambuf &output, const std::st
         for (Algorithm *algorithm : GetAlgorithms())
             alloc = Align(alloc + directory + (special + normal) * algorithm->size_, 16);
 
-#ifndef LDID_NOSMIME
         if (!key.empty()) {
             alloc += sizeof(struct BlobIndex);
             alloc += sizeof(struct Blob);
             alloc += certificate;
         }
-#endif
 
         return alloc;
     }), fun([&](const MachHeader &mach_header, const Baton &baton, std::streambuf &output, size_t limit, size_t left, size_t right, const std::string &overlap, const char *top, const Progress &progress) -> size_t {
@@ -2239,10 +2274,12 @@ Hash Sign(const void *idata, size_t isize, std::streambuf &output, const std::st
             put(data, baton.entitlements_.data(), baton.entitlements_.size());
             insert(blobs, CSSLOT_ENTITLEMENTS, CSMAGIC_EMBEDDED_ENTITLEMENTS, data);
 
-#ifndef LDID_NOPLIST
             auto entitlements(plist(baton.entitlements_));
             _scope({ plist_free(entitlements); });
-            _assert(plist_get_node_type(entitlements) == PLIST_DICT);
+            if (plist_get_node_type(entitlements) != PLIST_DICT) {
+                fprintf(stderr, "ldid: Entitlements should be a plist dicionary\n");
+                exit(1);
+            }
 
             const auto entitled([&](const char *key) {
                 auto item(plist_dict_get_item(entitlements, key));
@@ -2267,7 +2304,6 @@ Hash Sign(const void *idata, size_t isize, std::streambuf &output, const std::st
                 execs |= kSecCodeExecSegCanLoadCdHash;
             if (entitled("com.apple.private.amfi.can-execute-cdhash"))
                 execs |= kSecCodeExecSegCanExecCdHash;
-#endif
         }
 
         if (!baton.derformat_.empty()) {
@@ -2307,7 +2343,7 @@ Hash Sign(const void *idata, size_t isize, std::streambuf &output, const std::st
             directory.nCodeSlots = Swap(normal);
             directory.hashSize = algorithm.size_;
             directory.hashType = algorithm.type_;
-            directory.platform = platform ? 0x01 : 0x00;
+            directory.platform = platform;
             directory.pageSize = PageShift_;
             directory.spare2 = Swap(uint32_t(0));
             directory.scatterOffset = Swap(uint32_t(0));
@@ -2370,26 +2406,15 @@ Hash Sign(const void *idata, size_t isize, std::streambuf &output, const std::st
             ++total;
         }
 
-#ifndef LDID_NOSMIME
         if (!key.empty()) {
-#ifdef LDID_NOPLIST
-            auto plist(CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks));
-            _scope({ CFRelease(plist); });
-
-            auto cdhashes(CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks));
-            _scope({ CFRelease(cdhashes); });
-
-            CFDictionarySetValue(plist, CFSTR("cdhashes"), cdhashes);
-#else
             auto plist(plist_new_dict());
             _scope({ plist_free(plist); });
 
             auto cdhashes(plist_new_array());
             plist_dict_set_item(plist, "cdhashes", cdhashes);
-#endif
+
             std::vector<char> alternateCDSHA256;
             std::vector<char> alternateCDSHA1;
-            
 
             unsigned total(0);
             for (Algorithm *pointer : GetAlgorithms()) {
@@ -2402,43 +2427,26 @@ Hash Sign(const void *idata, size_t isize, std::streambuf &output, const std::st
                 std::vector<char> hash;
                 algorithm(hash, blob.data(), blob.size());
                 if (algorithm.type_ == CS_HASHTYPE_SHA256_256)
-                {
                     alternateCDSHA256 = hash;
-                }
-                else
-                {
+                else if (algorithm.type_ == CS_HASHTYPE_SHA160_160)
                     alternateCDSHA1 = hash;
-                }
                 hash.resize(20);
 
-#ifdef LDID_NOPLIST
-                auto value(CFDataCreate(kCFAllocatorDefault, reinterpret_cast<const UInt8 *>(hash.data()), hash.size()));
-                _scope({ CFRelease(value); });
-                CFArrayAppendValue(cdhashes, value);
-#else
                 plist_array_append_item(cdhashes, plist_new_data(hash.data(), hash.size()));
-#endif
             }
 
-#ifdef LDID_NOPLIST
-            auto created(CFPropertyListCreateXMLData(kCFAllocatorDefault, plist));
-            _scope({ CFRelease(created); });
-            auto xml(reinterpret_cast<const char *>(CFDataGetBytePtr(created)));
-            auto size(CFDataGetLength(created));
-#else
             char *xml(NULL);
             uint32_t size;
             plist_to_xml(plist, &xml, &size);
             _scope({ free(xml); });
-#endif
 
             std::stringbuf data;
             const std::string &sign(blobs[CSSLOT_CODEDIRECTORY]);
 
             Stuff stuff(key);
-            Buffer bio(sign);
+            //Buffer bio(sign);
 
-            Signature signature(stuff, sign, std::string(xml, size),alternateCDSHA1, alternateCDSHA256);
+            Signature signature(stuff, sign, std::string(xml, size), alternateCDSHA1, alternateCDSHA256);
             Buffer result(signature);
             std::string value(result);
             put(data, value.data(), value.size());
@@ -2446,7 +2454,6 @@ Hash Sign(const void *idata, size_t isize, std::streambuf &output, const std::st
             const auto &save(insert(blobs, CSSLOT_SIGNATURESLOT, CSMAGIC_BLOBWRAPPER, data));
             _assert(save.size() <= certificate);
         }
-#endif
 
         return put(output, CSMAGIC_EMBEDDED_SIGNATURE, blobs);
     }), progress);
@@ -2479,7 +2486,7 @@ DiskFolder::~DiskFolder() {
             Commit(commit.first, commit.second);
 }
 
-#ifndef __WIN32__
+#if !defined (__WIN32__) && !defined (_MSC_VER) && !defined (__MINGW32__)
 std::string readlink(const std::string &path) {
     for (size_t size(1024); ; size *= 2) {
         std::string data;
@@ -2511,11 +2518,10 @@ void DiskFolder::Find(const std::string &root, const std::string &base, const Fu
 
         bool directory;
 
-#ifdef __WIN32__
+#if defined (__WIN32__) || defined (_MSC_VER) || defined (__MINGW32__)
         struct stat info;
         _syscall(stat((path + name).c_str(), &info));
-        if (false);
-        else if (S_ISDIR(info.st_mode))
+        if (S_ISDIR(info.st_mode))
             directory = true;
         else if (S_ISREG(info.st_mode))
             directory = false;
@@ -2573,7 +2579,7 @@ void DiskFolder::Open(const std::string &path, const Functor<void (std::streambu
 void DiskFolder::Find(const std::string &path, const Functor<void (const std::string &)> &code, const Functor<void (const std::string &, const Functor<std::string ()> &)> &link) const {
     Find(path, "", code, link);
 }
-#endif
+#endif // LDID_NOTOOLS
 
 SubFolder::SubFolder(Folder &parent, const std::string &path) :
     parent_(parent),
@@ -2683,7 +2689,6 @@ static void copy(std::streambuf &source, std::streambuf &target, size_t length, 
     }
 }
 
-#ifndef LDID_NOPLIST
 static plist_t plist(const std::string &data) {
     if (data.empty())
         return plist_new_dict();
@@ -2692,7 +2697,10 @@ static plist_t plist(const std::string &data) {
         plist_from_bin(data.data(), data.size(), &plist);
     else
         plist_from_xml(data.data(), data.size(), &plist);
-    _assert(plist != NULL);
+    if (plist == NULL) {
+        fprintf(stderr, "ldid: Failed to parse plist\n");
+        exit(1);
+    }
     return plist;
 }
 
@@ -2701,19 +2709,25 @@ static void plist_d(std::streambuf &buffer, size_t length, const Functor<void (p
     copy(buffer, data, length, dummy_);
     auto node(plist(data.str()));
     _scope({ plist_free(node); });
-    _assert(plist_get_node_type(node) == PLIST_DICT);
+    if (plist_get_node_type(node) != PLIST_DICT) {
+        fprintf(stderr, "ldid: Unexpected plist type. Expected <dict>\n");
+        exit(1);
+    }
     code(node);
 }
 
 static std::string plist_s(plist_t node) {
-    _assert(node != NULL);
-    _assert(plist_get_node_type(node) == PLIST_STRING);
+    if (node == NULL)
+        return NULL;
+    if (plist_get_node_type(node) != PLIST_STRING) {
+        fprintf(stderr, "ldid: Unexpected plist type. Expected <string>\n");
+        exit(1);
+    }
     char *data;
     plist_get_string_val(node, &data);
     _scope({ free(data); });
     return data;
 }
-#endif
 
 enum Mode {
     NoMode,
@@ -2799,8 +2813,7 @@ struct RuleCode {
     }
 };
 
-#ifndef LDID_NOPLIST
-static Hash Sign(const uint8_t *prefix, size_t size, std::streambuf &buffer, Hash &hash, std::streambuf &save, const std::string &identifier, const std::string &entitlements, bool merge, const std::string &requirements, const std::string &key, const Slots &slots, size_t length, uint32_t flags, bool platform, const Progress &progress) {
+static Hash Sign(const uint8_t *prefix, size_t size, std::streambuf &buffer, Hash &hash, std::streambuf &save, const std::string &identifier, const std::string &entitlements, bool merge, const std::string &requirements, const std::string &key, const Slots &slots, size_t length, uint32_t flags, uint8_t platform, const Progress &progress) {
     // XXX: this is a miserable fail
     std::stringbuf temp;
     put(temp, prefix, size);
@@ -2825,7 +2838,7 @@ struct State {
     }
 };
 
-Bundle Sign(const std::string &root, Folder &parent, const std::string &key, State &local, const std::string &requirements, const Functor<std::string (const std::string &, const std::string &)> &alter, const Progress &progress) {
+Bundle Sign(const std::string &root, Folder &parent, const std::string &key, State &local, const std::string &requirements, const Functor<std::string (const std::string &, const std::string &)> &alter, bool merge, uint8_t platform, const Progress &progress) {
     std::string executable;
     std::string identifier;
 
@@ -2837,19 +2850,31 @@ Bundle Sign(const std::string &root, Folder &parent, const std::string &key, Sta
         if (parent.Look(info))
             return "";
         mac = true;
-        if (false);
-        else if (parent.Look("Contents/" + info))
+        if (parent.Look("Contents/" + info))
             return "Contents/";
         else if (parent.Look("Resources/" + info)) {
             info = "Resources/" + info;
             return "";
-        } else _assert_(false, "cannot find Info.plist");
+        } else {
+            fprintf(stderr, "ldid: Could not find Info.plist\n");
+            exit(1);
+        }
     }());
 
     folder.Open(info, fun([&](std::streambuf &buffer, size_t length, const void *flag) {
         plist_d(buffer, length, fun([&](plist_t node) {
-            executable = plist_s(plist_dict_get_item(node, "CFBundleExecutable"));
-            identifier = plist_s(plist_dict_get_item(node, "CFBundleIdentifier"));
+            plist_t nodebuf(plist_dict_get_item(node, "CFBundleExecutable"));
+            if (nodebuf == NULL) {
+                fprintf(stderr, "ldid: Cannot find key CFBundleExecutable\n");
+                exit(1);
+            }
+            executable = plist_s(nodebuf);
+            nodebuf = plist_dict_get_item(node, "CFBundleIdentifier");
+            if (nodebuf == NULL) {
+                fprintf(stderr, "ldid: Cannot find key CFBundleIdentifier\n");
+                exit(1);
+            }
+            identifier = plist_s(nodebuf);
         }));
     }));
 
@@ -2921,7 +2946,7 @@ Bundle Sign(const std::string &root, Folder &parent, const std::string &key, Sta
         State remote;
         bundles[nested[1]] = Sign(root + bundle, subfolder, key, remote, "", Starts(name, "PlugIns/") ? alter :
             static_cast<const Functor<std::string (const std::string &, const std::string &)> &>(fun([&](const std::string &, const std::string &) -> std::string { return entitlements; }))
-        , progress);
+        , merge, platform, progress);
         local.Merge(bundle, remote);
     }), fun([&](const std::string &name, const Functor<std::string ()> &read) {
     }));
@@ -2975,7 +3000,7 @@ Bundle Sign(const std::string &root, Folder &parent, const std::string &key, Sta
                     case MH_CIGAM: case MH_CIGAM_64:
                         folder.Save(name, true, flag, fun([&](std::streambuf &save) {
                             Slots slots;
-                            Sign(header.bytes, size, data, hash, save, identifier, "", false, "", key, slots, length, 0, false, Progression(progress, root + name));
+                            Sign(header.bytes, size, data, hash, save, identifier, "", false, "", key, slots, length, 0, platform, Progression(progress, root + name));
                         }));
                         return;
                 }
@@ -3105,18 +3130,17 @@ Bundle Sign(const std::string &root, Folder &parent, const std::string &key, Sta
             Slots slots;
             slots[1] = local.files.at(info);
             slots[3] = local.files.at(signature);
-            bundle.hash = Sign(NULL, 0, buffer, local.files[executable], save, identifier, entitlements, false, requirements, key, slots, length, 0, false, Progression(progress, root + executable));
+            bundle.hash = Sign(NULL, 0, buffer, local.files[executable], save, identifier, entitlements, merge, requirements, key, slots, length, 0, platform, Progression(progress, root + executable));
         }));
     }));
 
     return bundle;
 }
 
-Bundle Sign(const std::string &root, Folder &folder, const std::string &key, const std::string &requirements, const Functor<std::string (const std::string &, const std::string &)> &alter, const Progress &progress) {
+Bundle Sign(const std::string &root, Folder &folder, const std::string &key, const std::string &requirements, const Functor<std::string (const std::string &, const std::string &)> &alter, bool merge, uint8_t platform, const Progress &progress) {
     State local;
-    return Sign(root, folder, key, local, requirements, alter, progress);
+    return Sign(root, folder, key, local, requirements, alter, merge, platform, progress);
 }
-#endif
 
 #endif
 }
@@ -3132,13 +3156,13 @@ std::string Hex(const uint8_t *data, size_t size) {
 }
 
 static void usage(const char *argv0) {
-   // fprintf(stderr, "Link Identity Editor %s\n\n", LDID_VERSION);
+  //  fprintf(stderr, "Link Identity Editor %s\n\n", LDID_VERSION);
     fprintf(stderr, "Usage: %s [-Acputype:subtype] [-a] [-C[adhoc | enforcement | expires | hard |\n", argv0);
     fprintf(stderr, "            host | kill | library-validation | restrict | runtime]] [-D] [-d]\n");
     fprintf(stderr, "            [-Enum:file] [-e] [-H[sha1 | sha256]] [-h] [-Iname]\n");
-    fprintf(stderr, "            [-Kkey.p12 [-Upassword]] [-M] [-P] [-Qrequirements.xml] [-q]\n");
-    fprintf(stderr, "            [-r | -Sfile.xml | -s] [-Ttimestamp] [-u] [-arch arch_type] file ...\n");
-    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "            [-Kkey.p12 [-Upassword]] [-M] [-P[num]] [-Qrequirements.xml] [-q]\n");
+    fprintf(stderr, "            [-r | -Sfile.xml | -s] [-u] [-arch arch_type] file ...\n");
+    fprintf(stderr, "Common Options:\n");
     fprintf(stderr, "   -S[file.xml]  Pseudo-sign using the entitlements in file.xml\n");
     fprintf(stderr, "   -Kkey.p12     Sign using private key in key.p12\n");
     fprintf(stderr, "   -Upassword    Use password to unlock key.p12\n");
@@ -3147,15 +3171,19 @@ static void usage(const char *argv0) {
     fprintf(stderr, "More information: 'man ldid'\n");
 }
 
+void cleanupfunc(void) {
+    for (const auto &temp : cleanup)
+        remove(temp.c_str());
+}
+
 #ifndef LDID_NOTOOLS
 int main(int argc, char *argv[]) {
-#ifndef LDID_NOSMIME
+    std::atexit(cleanupfunc);
     OpenSSL_add_all_algorithms();
 # if OPENSSL_VERSION_MAJOR >= 3
     OSSL_PROVIDER *legacy = OSSL_PROVIDER_load(NULL, "legacy");
     OSSL_PROVIDER *deflt = OSSL_PROVIDER_load(NULL, "default");
 # endif
-#endif
 
     union {
         uint16_t word;
@@ -3171,9 +3199,6 @@ int main(int argc, char *argv[]) {
     bool flag_H(false);
     bool flag_h(false);
 
-#ifndef LDID_NOFLAGT
-    bool flag_T(false);
-#endif
 
     bool flag_S(false);
     bool flag_s(false);
@@ -3189,17 +3214,13 @@ int main(int argc, char *argv[]) {
     bool flag_M(false);
 
     uint32_t flags(0);
-    bool platform(false);
+    uint8_t platform(0);
 
     uint32_t flag_CPUType(_not(uint32_t));
     uint32_t flag_CPUSubtype(_not(uint32_t));
 
     const char *flag_I(NULL);
 
-#ifndef LDID_NOFLAGT
-    bool timeh(false);
-    uint32_t timev(0);
-#endif
 
     Map entitlements;
     Map requirements;
@@ -3220,6 +3241,10 @@ int main(int argc, char *argv[]) {
             bool foundarch = false;
             flag_A = true;
             argi++;
+            if (argi == argc) {
+                fprintf(stderr, "ldid: -arch must be followed by an architecture string\n");
+                exit(1);
+            }
             for (int i = 0; archs[i].name != NULL; i++) {
                 if (strcmp(archs[i].name, argv[argi]) == 0) {
                     flag_CPUType = archs[i].cputype;
@@ -3236,8 +3261,10 @@ int main(int argc, char *argv[]) {
             }
         } else switch (argv[argi][1]) {
             case 'r':
-                _assert(!flag_s);
-                _assert(!flag_S);
+                if (flag_s || flag_S) {
+                    fprintf(stderr, "ldid: Can only specify one of -r, -S, -s\n");
+                    exit(1);
+                }
                 flag_r = true;
             break;
 
@@ -3246,11 +3273,17 @@ int main(int argc, char *argv[]) {
             case 'E': {
                 const char *string = argv[argi] + 2;
                 const char *colon = strchr(string, ':');
-                _assert(colon != NULL);
+                if (colon == NULL) {
+                    usage(argv[0]);
+                    exit(1);
+                }
                 Map file(colon + 1, O_RDONLY, PROT_READ, MAP_PRIVATE);
                 char *arge;
                 unsigned number(strtoul(string, &arge, 0));
-                _assert(arge == colon);
+                if (arge != colon || (number == 0 && errno == EINVAL)) {
+                    usage(argv[0]);
+                    exit(1);
+                }
                 auto &slot(slots[number]);
                 for (Algorithm *algorithm : GetAlgorithms())
                     (*algorithm)(slot, file.data(), file.size());
@@ -3268,12 +3301,14 @@ int main(int argc, char *argv[]) {
                     do_sha256 = false;
                 }
 
-                if (false);
-                else if (strcmp(hash, "sha1") == 0)
+                if (strcmp(hash, "sha1") == 0)
                     do_sha1 = true;
                 else if (strcmp(hash, "sha256") == 0)
                     do_sha256 = true;
-                else _assert(false);
+                else {
+                    fprintf(stderr, "ldid: only sha1 and sha256 are supported at this time\n");
+                    exit(1);
+                }
             } break;
 
             case 'h': flag_h = true; break;
@@ -3289,24 +3324,35 @@ int main(int argc, char *argv[]) {
             case 'a': flag_a = true; break;
 
             case 'A':
-                _assert(!flag_A);
+                if (flag_A) {
+                    fprintf(stderr, "ldid: -A can only be specified once\n");
+                    exit(1);
+                }
                 flag_A = true;
                 if (argv[argi][2] != '\0') {
                     const char *cpu = argv[argi] + 2;
                     const char *colon = strchr(cpu, ':');
-                    _assert(colon != NULL);
+                    if (colon == NULL) {
+                        usage(argv[0]);
+                        exit(1);
+                    }
                     char *arge;
                     flag_CPUType = strtoul(cpu, &arge, 0);
-                    _assert(arge == colon);
+                    if (arge != colon || (flag_CPUType == 0 && errno == EINVAL)) {
+                        usage(argv[0]);
+                        exit(1);
+                    }
                     flag_CPUSubtype = strtoul(colon + 1, &arge, 0);
-                    _assert(arge == argv[argi] + strlen(argv[argi]));
+                    if (arge != argv[argi] + strlen(argv[argi]) || (flag_CPUSubtype == 0 && errno == EINVAL)) {
+                        usage(argv[0]);
+                        exit(1);
+                    }
                 }
             break;
 
             case 'C': {
                 const char *name = argv[argi] + 2;
-                if (false);
-                else if (strcmp(name, "host") == 0)
+                if (strcmp(name, "host") == 0)
                     flags |= kSecCodeSignatureHost;
                 else if (strcmp(name, "adhoc") == 0)
                     flags |= kSecCodeSignatureAdhoc;
@@ -3324,22 +3370,37 @@ int main(int argc, char *argv[]) {
                     flags |= kSecCodeSignatureLibraryValidation;
                 else if (strcmp(name, "runtime") == 0)
                     flags |= kSecCodeSignatureRuntime;
-                else _assert(false);
+                else {
+                    fprintf(stderr, "ldid: -C: Unsupported option\n");
+                    exit(1);
+                }
             } break;
 
             case 'P':
-                platform = true;
+                if (argv[argi][2] != '\0') {
+                    char *platformchar = argv[argi] + 2;
+                    char *arge;
+                    platform = strtoul(platformchar, &arge, 0);
+                } else {
+                    platform = 13;
+                }
             break;
 
             case 's':
-                _assert(!flag_r);
-                _assert(!flag_S);
+                if (flag_r || flag_S) {
+                    fprintf(stderr, "ldid: Can only specify one of -r, -S, -s\n");
+                    exit(1);
+                }
                 flag_s = true;
+                entitlements.clear();
+                flag_M = true;
             break;
 
             case 'S':
-                _assert(!flag_r);
-                _assert(!flag_s);
+                if (flag_r || flag_s) {
+                    fprintf(stderr, "ldid: Can only specify one of -r, -S, -s\n");
+                    exit(1);
+                }
                 flag_S = true;
                 if (argv[argi][2] != '\0') {
                     const char *xml = argv[argi] + 2;
@@ -3360,18 +3421,7 @@ int main(int argc, char *argv[]) {
                     key.open(argv[argi] + 2, O_RDONLY, PROT_READ, MAP_PRIVATE);
             break;
 
-#ifndef LDID_NOFLAGT
-            case 'T': {
-                flag_T = true;
-                if (argv[argi][2] == '-')
-                    timeh = true;
-                else {
-                    char *arge;
-                    timev = strtoul(argv[argi] + 2, &arge, 0);
-                    _assert(arge == argv[argi] + strlen(argv[argi]));
-                }
-            } break;
-#endif
+            case 'T': break;
 
             case 'u': {
                 flag_u = true;
@@ -3387,12 +3437,9 @@ int main(int argc, char *argv[]) {
             break;
         }
 
-    _assert(flag_S || key.empty());
-    _assert(flag_S || flag_I == NULL);
-
-    if (flag_d && !flag_h) {
-        flag_h = true;
-        fprintf(stderr, "WARNING: -d also (temporarily) does the behavior of -h for compatibility with a fork of ldid\n");
+    if (flag_I != NULL && !flag_S) {
+        fprintf(stderr, "ldid: -I requires -S\n");
+        exit(1);
     }
 
     if (files.empty())
@@ -3403,17 +3450,19 @@ int main(int argc, char *argv[]) {
         std::string path(file);
 
         struct stat info;
-        _syscall(stat(path.c_str(), &info));
+        if (stat(path.c_str(), &info) == -1) {
+            fprintf(stderr, "ldid: %s: %s\n", path.c_str(), strerror(errno));
+            exit(1);
+        }
 
         if (S_ISDIR(info.st_mode)) {
-            _assert(flag_S);
-#ifndef LDID_NOPLIST
+            if (!flag_S && !flag_s) {
+                fprintf(stderr, "ldid: Only -S and -s can be used on directories\n");
+                exit(1);
+            }
             ldid::DiskFolder folder(path + "/");
-            path += "/" + Sign("", folder, key, requirements, ldid::fun([&](const std::string &, const std::string &) -> std::string { return entitlements; }), dummy_).path;
-#else
-            _assert(false);
-#endif
-        } else if (flag_S || flag_r) {
+            path += "/" + Sign("", folder, key, requirements, ldid::fun([&](const std::string &, const std::string &) -> std::string { return entitlements; }), flag_M, platform, dummy_).path;
+        } else if (flag_S || flag_r || flag_s) {
             Map input(path, O_RDONLY, PROT_READ, MAP_PRIVATE);
 
             std::filebuf output;
@@ -3427,18 +3476,13 @@ int main(int argc, char *argv[]) {
                 ldid::Sign(input.data(), input.size(), output, identifier, entitlements, flag_M, requirements, key, slots, flags, platform, dummy_);
             }
 
+            input.clear();
+            output.close();
+
             Commit(path, temp);
         }
 
-        bool modify(false);
-#ifndef LDID_NOFLAGT
-        if (flag_T)
-            modify = true;
-#endif
-        if (flag_s)
-            modify = true;
-
-        Map mapping(path, modify);
+        Map mapping(path, flag_D ? true : false);
         FatHeader fat_header(mapping.data(), mapping.size());
 
         _foreach (mach_header, fat_header.GetMachHeaders()) {
@@ -3458,8 +3502,7 @@ int main(int argc, char *argv[]) {
             _foreach (load_command, mach_header.GetLoadCommands()) {
                 uint32_t cmd(mach_header.Swap(load_command->cmd));
 
-                if (false);
-                else if (cmd == LC_CODE_SIGNATURE)
+                if (cmd == LC_CODE_SIGNATURE)
                     signature = reinterpret_cast<struct linkedit_data_command *>(load_command);
                 else if (cmd == LC_ENCRYPTION_INFO || cmd == LC_ENCRYPTION_INFO_64)
                     encryption = reinterpret_cast<struct encryption_info_command *>(load_command);
@@ -3475,24 +3518,6 @@ int main(int argc, char *argv[]) {
                         }
                     }
                 }
-#ifndef LDID_NOFLAGT
-                else if (cmd == LC_ID_DYLIB) {
-                    volatile struct dylib_command *dylib_command(reinterpret_cast<struct dylib_command *>(load_command));
-
-                    if (flag_T) {
-                        uint32_t timed;
-
-                        if (!timeh)
-                            timed = timev;
-                        else {
-                            dylib_command->dylib.timestamp = 0;
-                            timed = hash(reinterpret_cast<uint8_t *>(mach_header.GetBase()), mach_header.GetSize(), timev);
-                        }
-
-                        dylib_command->dylib.timestamp = mach_header.Swap(timed);
-                    }
-                }
-#endif
             }
 
             if (flag_d && encryption != NULL) {
@@ -3500,13 +3525,19 @@ int main(int argc, char *argv[]) {
             }
 
             if (flag_D) {
-                _assert(encryption != NULL);
+                if (encryption == NULL) {
+                    fprintf(stderr, "ldid: -D requires an encrypted binary\n");
+                    exit(1);
+                }
                 encryption->cryptid = mach_header.Swap(0);
             }
 
-            if (flag_e) {
-                _assert(signature != NULL);
+            if ((flag_e || flag_q || flag_h) && signature == NULL) {
+                fprintf(stderr, "ldid: -e, -q, and -h requre a signed binary\n");
+                exit(1);
+            }
 
+            if (flag_e) {
                 uint32_t data = mach_header.Swap(signature->dataoff);
 
                 uint8_t *top = reinterpret_cast<uint8_t *>(mach_header.GetBase());
@@ -3522,8 +3553,6 @@ int main(int argc, char *argv[]) {
             }
 
             if (flag_q) {
-                _assert(signature != NULL);
-
                 uint32_t data = mach_header.Swap(signature->dataoff);
 
                 uint8_t *top = reinterpret_cast<uint8_t *>(mach_header.GetBase());
@@ -3538,33 +3567,17 @@ int main(int argc, char *argv[]) {
                     }
             }
 
-            if (flag_s) {
-                _assert(signature != NULL);
-
-                uint32_t data = mach_header.Swap(signature->dataoff);
-
-                uint8_t *top = reinterpret_cast<uint8_t *>(mach_header.GetBase());
-                uint8_t *blob = top + data;
-                struct SuperBlob *super = reinterpret_cast<struct SuperBlob *>(blob);
-
-                for (size_t index(0); index != Swap(super->count); ++index)
-                    if (Swap(super->index[index].type) == CSSLOT_CODEDIRECTORY) {
-                        uint32_t begin = Swap(super->index[index].offset);
-                        struct CodeDirectory *directory = reinterpret_cast<struct CodeDirectory *>(blob + begin + sizeof(Blob));
-
-                        uint8_t (*hashes)[LDID_SHA1_DIGEST_LENGTH] = reinterpret_cast<uint8_t (*)[LDID_SHA1_DIGEST_LENGTH]>(blob + begin + Swap(directory->hashOffset));
-                        uint32_t pages = Swap(directory->nCodeSlots);
-
-                        if (pages != 1)
-                            for (size_t i = 0; i != pages - 1; ++i)
-                                LDID_SHA1(top + PageSize_ * i, PageSize_, hashes[i]);
-                        if (pages != 0)
-                            LDID_SHA1(top + PageSize_ * (pages - 1), ((data - 1) % PageSize_) + 1, hashes[pages - 1]);
-                    }
-            }
-
             if (flag_h) {
-                _assert(signature != NULL);
+                #if defined (__WIN32__) || defined (_MSC_VER) || defined (__MINGW32__)
+                    #define realpath(N,R) _fullpath((R),(N),PATH_MAX)
+                #endif
+                char *buf = realpath(file.c_str(), NULL);
+                if (buf == NULL) {
+                    fprintf(stderr, "ldid: realpath: %s\n", strerror(errno));
+                    exit(1);
+                }
+                printf("Executable=%s\n", buf);
+                free(buf);
 
                 auto algorithms(GetAlgorithms());
 
@@ -3579,9 +3592,11 @@ int main(int argc, char *argv[]) {
                     size_t size_;
                     Algorithm &algorithm_;
                     std::string hash_;
+                    uint32_t offset;
                 };
 
                 std::map<uint8_t, Candidate> candidates;
+                uint32_t cmsBegin = 0, cmsEnd = 0;
 
                 for (size_t index(0); index != Swap(super->count); ++index) {
                     auto type(Swap(super->index[index].type));
@@ -3594,7 +3609,10 @@ int main(int argc, char *argv[]) {
                         auto &algorithm(*algorithms[type - 1]);
                         uint8_t hash[algorithm.size_];
                         algorithm(hash, blob + begin, end - begin);
-                        candidates.insert({type, {directory, end - begin, algorithm, Hex(hash, 20)}});
+                        candidates.insert({type, {directory, end - begin, algorithm, Hex(hash, algorithm.size_), begin}});
+                    } else if (type == CSSLOT_SIGNATURESLOT) {
+                        cmsBegin = Swap(super->index[index].offset);
+                        cmsEnd = index + 1 == Swap(super->count) ? Swap(super->blob.length) : Swap(super->index[index + 1].offset);
                     }
                 }
 
@@ -3604,6 +3622,8 @@ int main(int argc, char *argv[]) {
 
                 const auto directory(best->second.directory_);
                 const auto flags(Swap(directory->flags));
+
+                printf("Identifier=%s\n", blob + best->second.offset + Swap(directory->identOffset));
 
                 std::string names;
                 if (flags & kSecCodeSignatureHost)
@@ -3634,11 +3654,63 @@ int main(int argc, char *argv[]) {
                     auto choice(candidate.second.algorithm_.name());
                     choices += ',';
                     choices += choice;
-                    printf("CandidateCDHash %s=%s\n", choice, candidate.second.hash_.c_str());
+                    printf("CandidateCDHash %s=%.40s\n", choice, candidate.second.hash_.c_str());
+                    printf("CandidateCDHashFull %s=%s\n", choice, candidate.second.hash_.c_str());
                 }
                 printf("Hash choices=%s\n", choices.c_str() + 1);
 
-                printf("CDHash=%s\n", best->second.hash_.c_str());
+                printf("CDHash=%.40s\n", best->second.hash_.c_str());
+
+                if (cmsBegin != 0 && cmsEnd != 0) {
+                    // This loads the CMS blob and parses each X509 cert in the blob to extract the
+                    // common name and print it as "Authority=%s"
+                    Buffer bio(reinterpret_cast<const char *>(blob) + cmsBegin + sizeof(Blob), cmsEnd - cmsBegin);
+                    PKCS7 *p7 = NULL;
+                    if ((p7 = d2i_PKCS7_bio(bio, NULL)) == NULL) {
+                        // In order to follow codesign, we just ignore errors
+                        printf("Authority=(unavailable)\n");
+                    } else {
+                        STACK_OF(X509) *certs = NULL;
+                        switch (OBJ_obj2nid(p7->type)) {
+                            case NID_pkcs7_signed:
+                                if (p7->d.sign != NULL)
+                                    certs = p7->d.sign->cert;
+                                break;
+                            case NID_pkcs7_signedAndEnveloped:
+                                if (p7->d.signed_and_enveloped != NULL)
+                                    certs = p7->d.signed_and_enveloped->cert;
+                                break;
+                            default:
+                                break;
+                        }
+                        if (certs != NULL) {
+                            X509 *x;
+                            for (int i = 0; i < sk_X509_num(certs); i++) {
+                                x = sk_X509_value(certs, i);
+                                int lastpos = -1;
+                                X509_NAME *nm = X509_get_subject_name(x);
+                                X509_NAME_ENTRY *e;
+
+                                for (;;) {
+                                    lastpos = X509_NAME_get_index_by_NID(nm, NID_commonName, lastpos);
+                                    if (lastpos == -1)
+                                        break;
+                                    e = X509_NAME_get_entry(nm, lastpos);
+                                    ASN1_STRING *s = X509_NAME_ENTRY_get_data(e);
+                                    printf("Authority=%s\n", reinterpret_cast<const char *>(ASN1_STRING_get0_data(s)));
+                                }
+                            }
+                        } else {
+                            printf("Authority=(unavailable)\n");
+                        }
+                    }
+                    PKCS7_free(p7);
+                }
+
+                if (Swap(directory->teamIDOffset) > 0)
+                    printf("TeamIdentifier=%s\n", blob + best->second.offset + Swap(directory->teamIDOffset));
+                else
+                    printf("TeamIdentifier=not set\n");
             }
         }
 
@@ -3648,13 +3720,11 @@ int main(int argc, char *argv[]) {
         ++filei;
     }
 
-#ifndef LDID_NOSMIME
 # if OPENSSL_VERSION_MAJOR >= 3
     OSSL_PROVIDER_unload(legacy);
     OSSL_PROVIDER_unload(deflt);
 # endif
-#endif
 
     return filee;
 }
-#endif
+#endif // LDID_NOTOOLS
